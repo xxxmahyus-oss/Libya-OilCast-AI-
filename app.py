@@ -10,6 +10,8 @@ from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegresso
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
+from smart_data_engine import classify_dataset, detect_columns, detect_units, profile_data
+
 APP_NAME = "Libya OilCast AI"
 st.set_page_config(page_title=APP_NAME, page_icon="🛢️", layout="wide")
 
@@ -264,8 +266,7 @@ def make_synthetic_data(n_wells=8, n_days=900, seed=42):
     return pd.DataFrame(rows)
 
 FEATURES = ["day_index", "lag_1", "lag_7", "lag_14", "lag_30",
-            "rolling_mean_7", "rolling_mean_30", "water_cut_pct",
-            "pressure_psi", "choke_pct", "uptime_pct", "month"] 
+            "rolling_mean_7", "rolling_mean_30", "month"]
 
 # قاموس موحد لمتغيرات بيانات الآبار وأسمائها البديلة.
 # المطابقة هنا اقتراح أولي فقط؛ الاعتماد النهائي يتم من واجهة المراجعة.
@@ -435,6 +436,7 @@ def detect_oil_columns(df):
 
 
 def prepare_well_data(df):
+    """Prepare production history without inventing missing operating measurements."""
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["oil_production_bopd"] = pd.to_numeric(df["oil_production_bopd"], errors="coerce")
@@ -444,18 +446,25 @@ def prepare_well_data(df):
         df["well"] = "WELL-001"
     if "field" not in df:
         df["field"] = "Imported Field"
-    for c, default in [("water_cut_pct", 25.0), ("pressure_psi", 2500.0),
-                       ("choke_pct", 65.0), ("uptime_pct", 95.0)]:
-        if c not in df:
-            df[c] = default
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(default)
+
+    # Keep only optional measurements that actually exist in the uploaded file.
+    # Missing values remain NaN; no default pressure/water-cut/choke/uptime is fabricated.
+    optional_numeric = [
+        col for col in [
+            "water_cut_pct", "pressure_psi", "reservoir_pressure", "bhp", "whp",
+            "choke_pct", "choke_size", "uptime_pct", "water_production_rate",
+            "gas_production_rate", "liquid_production_rate"
+        ]
+        if col in df.columns
+    ]
+    for col in optional_numeric:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df = df.sort_values(["well", "date"])
-    # If duplicate daily records exist for a well, average them rather than silently summing.
-    df = df.groupby(["field", "well", "date"], as_index=False).agg({
-        "oil_production_bopd":"mean", "water_cut_pct":"mean",
-        "pressure_psi":"mean", "choke_pct":"mean", "uptime_pct":"mean"
-    })
-    return df
+    aggregations = {"oil_production_bopd": "mean"}
+    aggregations.update({col: "mean" for col in optional_numeric})
+    # Average duplicate daily measurements rather than silently summing rates.
+    return df.groupby(["field", "well", "date"], as_index=False).agg(aggregations)
 
 def add_features(one):
     one = one.sort_values("date").copy()
@@ -713,16 +722,7 @@ def forecast_one_well(group, model, horizon):
         .reset_index(drop=True)
     )
 
-    required = [
-        "date",
-        "well",
-        "field",
-        "oil_production_bopd",
-        "water_cut_pct",
-        "pressure_psi",
-        "choke_pct",
-        "uptime_pct",
-    ]
+    required = ["date", "well", "field", "oil_production_bopd"]
 
     if any(col not in hist.columns for col in required):
         return pd.DataFrame()
@@ -750,20 +750,6 @@ def forecast_one_well(group, model, horizon):
     ):
         return pd.DataFrame()
 
-    numeric_columns = [
-        "water_cut_pct",
-        "pressure_psi",
-        "choke_pct",
-        "uptime_pct",
-    ]
-
-    for col in numeric_columns:
-        hist[col] = pd.to_numeric(hist[col], errors="coerce")
-        hist[col] = hist[col].ffill().bfill()
-
-        if hist[col].isna().all():
-            hist[col] = 0.0
-
     result = []
 
     for step in range(int(horizon)):
@@ -780,10 +766,6 @@ def forecast_one_well(group, model, horizon):
             "field": hist["field"].iloc[-1],
             "well": hist["well"].iloc[-1],
             "oil_production_bopd": np.nan,
-            "water_cut_pct": float(hist["water_cut_pct"].iloc[-1]),
-            "pressure_psi": float(hist["pressure_psi"].iloc[-1]),
-            "choke_pct": float(hist["choke_pct"].iloc[-1]),
-            "uptime_pct": float(hist["uptime_pct"].iloc[-1]),
         }
 
         feat = {
@@ -796,10 +778,6 @@ def forecast_one_well(group, model, horizon):
             "lag_30": float(y.iloc[-30]),
             "rolling_mean_7": float(y.iloc[-7:].mean()),
             "rolling_mean_30": float(y.iloc[-30:].mean()),
-            "water_cut_pct": new["water_cut_pct"],
-            "pressure_psi": new["pressure_psi"],
-            "choke_pct": new["choke_pct"],
-            "uptime_pct": new["uptime_pct"],
             "month": new_date.month,
         }
 
@@ -882,6 +860,7 @@ page = st.sidebar.radio(
         "التنبؤ المستقبلي",
         "توقع إنتاج الحقول",
         "البيانات والتصدير",
+        "ذكاء البيانات",
         "عن المشروع",
     ]
 )
@@ -1146,20 +1125,31 @@ elif page == "تحليل الإنتاج":
         fig.update_layout(xaxis_title="التاريخ", yaxis_title="BOPD")
         st.plotly_chart(fig, use_container_width=True)
     with b:
-        fig = px.scatter(view_df.sample(min(2500,len(view_df)), random_state=int(seed)),
-                         x="water_cut_pct", y="oil_production_bopd", color="well",
-                         title="علاقة Water Cut بإنتاج النفط", trendline="ols")
-        fig.update_layout(xaxis_title="Water Cut (%)", yaxis_title="BOPD")
-        st.plotly_chart(fig, use_container_width=True)
+        if "water_cut_pct" in view_df.columns and view_df["water_cut_pct"].notna().any():
+            scatter_data = view_df.dropna(subset=["water_cut_pct", "oil_production_bopd"])
+            fig = px.scatter(scatter_data.sample(min(2500, len(scatter_data)), random_state=int(seed)),
+                             x="water_cut_pct", y="oil_production_bopd", color="well",
+                             title="علاقة Water Cut بإنتاج النفط", trendline="ols")
+            fig.update_layout(xaxis_title="Water Cut (%)", yaxis_title="BOPD")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("لا توجد قياسات Water Cut في البيانات الحالية.")
     c,d = st.columns(2)
     with c:
-        fig = px.line(view_df, x="date", y="pressure_psi", color="well", title="ضغط البئر (بيانات افتراضية/مرفوعة)")
-        fig.update_layout(xaxis_title="التاريخ", yaxis_title="Pressure (psi)")
-        st.plotly_chart(fig, use_container_width=True)
+        pressure_col = next((c for c in ["pressure_psi", "reservoir_pressure", "bhp", "whp"] if c in view_df.columns and view_df[c].notna().any()), None)
+        if pressure_col:
+            fig = px.line(view_df, x="date", y=pressure_col, color="well", title=f"تطور {pressure_col}")
+            fig.update_layout(xaxis_title="التاريخ", yaxis_title=pressure_col)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("لا توجد قياسات ضغط في البيانات الحالية.")
     with d:
-        fig = px.line(view_df, x="date", y="water_cut_pct", color="well", title="تطور نسبة الماء")
-        fig.update_layout(xaxis_title="التاريخ", yaxis_title="Water Cut (%)")
-        st.plotly_chart(fig, use_container_width=True)
+        if "water_cut_pct" in view_df.columns and view_df["water_cut_pct"].notna().any():
+            fig = px.line(view_df, x="date", y="water_cut_pct", color="well", title="تطور نسبة الماء")
+            fig.update_layout(xaxis_title="التاريخ", yaxis_title="Water Cut (%)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("لا توجد قياسات Water Cut في البيانات الحالية.")
     st.caption("الارتباطات المرئية لا تثبت السببية. تأكد من وحدات القياس وجودة البيانات قبل تفسيرها هندسياً.")
 
 
@@ -1799,6 +1789,90 @@ elif page == "توقع إنتاج الحقول":
 
 
 
+elif page == "ذكاء البيانات":
+    st.subheader("Smart Data Intelligence — ذكاء البيانات النفطية")
+    st.caption(
+        "حلّل ملفات الإنتاج والحفر وسوائل الحفر والمكامن واختبارات الآبار والسجلات. "
+        "هذه الصفحة تفحص البيانات وتقترح تخصصها؛ ولا تشغّل نموذج التنبؤ النفطي على كل تخصص."
+    )
+    smart_upload = st.file_uploader(
+        "ارفع ملف CSV أو Excel للتحليل الذكي",
+        type=["csv", "xlsx", "xls"],
+        key="smart_data_upload"
+    )
+    if smart_upload is not None:
+        try:
+            if smart_upload.name.lower().endswith(".csv"):
+                smart_df = pd.read_csv(smart_upload)
+            else:
+                smart_df = pd.read_excel(smart_upload)
+            smart_df.columns = smart_df.columns.astype(str).str.strip()
+
+            classification = classify_dataset(smart_df)
+            smart_profile = profile_data(smart_df)
+            unit_hints = detect_units(smart_df)
+            domain_names = {
+                "production": "الإنتاج",
+                "drilling": "الحفر",
+                "drilling_fluids": "سوائل الحفر",
+                "reservoir": "المكامن",
+                "well_testing": "اختبارات الآبار",
+                "well_logs": "السجلات الجيولوجية",
+                "unknown": "غير محدد"
+            }
+            m1, m2, m3 = st.columns(3)
+            m1.metric("عدد الصفوف", f"{smart_profile['row_count']:,}")
+            m2.metric("عدد الأعمدة", smart_profile["column_count"])
+            m3.metric("الصفوف المكررة", smart_profile["duplicate_rows"])
+
+            st.markdown("### التخصص الأقرب")
+            st.info(
+                f"اقتراح النظام: **{domain_names.get(classification['suggested_domain'], classification['suggested_domain'])}** "
+                f"| مستوى الثقة: **{classification['confidence']}**. "
+                "هذا تصنيف استدلالي من أسماء الأعمدة وليس حكماً نهائياً."
+            )
+            scores_df = pd.DataFrame(
+                [{"التخصص": domain_names.get(k, k), "درجة المطابقة": v}
+                 for k, v in classification["scores"].items()]
+            ).sort_values("درجة المطابقة", ascending=False)
+            st.dataframe(scores_df, use_container_width=True, hide_index=True)
+
+            st.markdown("### الأعمدة التي تعرّف عليها النظام")
+            detected_rows = []
+            for domain, variables in classification["all_detected_columns"].items():
+                for variable, source_column in variables.items():
+                    detected_rows.append({
+                        "التخصص": domain_names.get(domain, domain),
+                        "المتغير": variable,
+                        "العمود الأصلي": source_column
+                    })
+            if detected_rows:
+                st.dataframe(pd.DataFrame(detected_rows), use_container_width=True, hide_index=True)
+            else:
+                st.warning("لم يتعرف النظام على أعمدة معروفة. يمكنك مراجعة أسماء الأعمدة يدوياً.")
+
+            st.markdown("### فحص جودة البيانات والوحدات")
+            st.caption(
+                "الوحدات المعروضة مجرد تلميحات من اسم العمود؛ لا يتم تحويل القيم أو تأكيد الوحدة تلقائياً."
+            )
+            st.dataframe(smart_profile["columns"], use_container_width=True, hide_index=True)
+
+            outlier_total = int(smart_profile["columns"]["possible_outliers_iqr"].sum()) if not smart_profile["columns"].empty else 0
+            missing_total = int(smart_profile["columns"]["missing"].sum()) if not smart_profile["columns"].empty else 0
+            q1, q2 = st.columns(2)
+            q1.metric("إجمالي الخلايا المفقودة", f"{missing_total:,}")
+            q2.metric("مجموع القيم الشاذة المحتملة (IQR)", f"{outlier_total:,}")
+            st.warning(
+                "القيم الشاذة المحتملة ليست بالضرورة أخطاء؛ قد تمثل تغيرات تشغيلية حقيقية. "
+                "راجعها مع سياق البئر والوحدات قبل حذفها أو تعديلها."
+            )
+            st.markdown("### معاينة الملف")
+            st.dataframe(smart_df.head(30), use_container_width=True, hide_index=True)
+        except Exception as exc:
+            st.error(f"تعذر تحليل الملف: {exc}")
+    else:
+        st.info("ارفع ملفاً للبدء. يمكنك تحليل أي تخصص نفطي هنا دون إدخاله في نموذج التنبؤ بإنتاج النفط.")
+
 elif page == "البيانات والتصدير":
     st.subheader("رفع البيانات ومعاينتها وفحص جودتها")
 
@@ -1849,7 +1923,19 @@ elif page == "البيانات والتصدير":
                 "راجع كل اقتراح، خصوصاً الأعمدة ذات الأسماء العامة أو الوحدات غير الواضحة."
             )
 
+            smart_classification = classify_dataset(candidate)
+            smart_detected = detect_columns(candidate)
+            smart_units = detect_units(candidate)
+            smart_quality = profile_data(candidate)
             detected = detect_oil_columns(candidate)
+            # Use Smart Engine production aliases as additional suggestions only.
+            production_aliases = smart_detected.get("production", {})
+            if "date" in production_aliases:
+                detected.setdefault("date", production_aliases["date"])
+            if "oil_rate" in production_aliases:
+                detected.setdefault("oil_production_bopd", production_aliases["oil_rate"])
+            if "water_cut" in production_aliases:
+                detected.setdefault("water_cut_pct", production_aliases["water_cut"])
             no_match = "— غير موجود / اختر يدوياً —"
             mapping = {}
             mapping_labels = {}
@@ -1890,14 +1976,24 @@ elif page == "البيانات والتصدير":
             if required_missing:
                 st.warning("يلزم تحديد: " + " و ".join(required_missing))
 
-            st.markdown("### 3. فحص جودة البيانات")
-            quality = pd.DataFrame({
-                "العمود": candidate.columns,
-                "نوع البيانات": [str(candidate[c].dtype) for c in candidate.columns],
-                "القيم المفقودة": [int(candidate[c].isna().sum()) for c in candidate.columns],
-                "القيم الفريدة": [int(candidate[c].nunique()) for c in candidate.columns],
-            })
-            st.dataframe(quality, use_container_width=True, hide_index=True)
+            st.markdown("### 3. فحص جودة البيانات والذكاء")
+            domain_labels = {
+                "production": "الإنتاج", "drilling": "الحفر",
+                "drilling_fluids": "سوائل الحفر", "reservoir": "المكامن",
+                "well_testing": "اختبارات الآبار", "well_logs": "السجلات",
+                "unknown": "غير محدد"
+            }
+            st.info(
+                f"تخصص الملف المقترح: **{domain_labels.get(smart_classification['suggested_domain'], smart_classification['suggested_domain'])}** "
+                f"| الثقة: **{smart_classification['confidence']}**. "
+                "اقتراح آلي يحتاج مراجعتك."
+            )
+            st.caption("تلميحات الوحدات مستنتجة من أسماء الأعمدة فقط، ولا تعني تحويل القيم.")
+            st.dataframe(smart_quality["columns"], use_container_width=True, hide_index=True)
+            st.caption(
+                f"صفوف مكررة: {smart_quality['duplicate_rows']} | "
+                f"عدد تلميحات الوحدات: {sum(v is not None for v in smart_units.values())}"
+            )
 
             if mapping.get("date") is not None and mapping.get("oil_production_bopd") is not None:
                 parsed_dates = pd.to_datetime(candidate[mapping["date"]], errors="coerce")
@@ -2033,7 +2129,8 @@ elif page == "عن المشروع":
 
 **المكوّنات الحالية**
 - توليد بيانات اصطناعية متعددة الآبار لأغراض اختبار الواجهة.
-- هندسة خصائص زمنية (lags وrolling means).
+- محرك Smart Data Engine لتصنيف ملفات تخصصات النفط واقتراح الأعمدة وتلميحات الوحدات وفحص الجودة.
+- هندسة خصائص زمنية (lags وrolling means) لنموذج التنبؤ بإنتاج النفط.
 - مقارنة Linear Regression وRandom Forest وExtra Trees وHist Gradient Boosting مع Persistence Baseline.
 - تقسيم زمني للتدريب والاختبار.
 - عرض المقاييس والرسوم وتصدير CSV/PDF.
