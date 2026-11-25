@@ -138,13 +138,21 @@ def classify_dataset(df: pd.DataFrame) -> dict[str, Any]:
 
 
 def detect_units(df: pd.DataFrame) -> dict[str, str | None]:
-    """Suggest units from column labels only; never convert values automatically."""
+    """Suggest units from explicit header tokens/suffixes; never convert values."""
     result: dict[str, str | None] = {}
+    normalized_hints = {
+        candidate: {normalize_name(hint) for hint in hints}
+        for candidate, hints in UNIT_HINTS.items()
+    }
     for column in df.columns:
         label = normalize_name(column)
+        tokens = set(label.split("_"))
         unit = None
-        for candidate, hints in UNIT_HINTS.items():
-            if any(normalize_name(hint) in label for hint in hints):
+        for candidate, hints in normalized_hints.items():
+            if any(
+                hint == label or hint in tokens or label.endswith("_" + hint)
+                for hint in hints
+            ):
                 unit = candidate
                 break
         result[str(column)] = unit
@@ -154,6 +162,7 @@ def detect_units(df: pd.DataFrame) -> dict[str, str | None]:
 def profile_data(df: pd.DataFrame) -> dict[str, Any]:
     """Build a non-destructive data-quality profile for a DataFrame."""
     rows = []
+    units = detect_units(df)
     for col in df.columns:
         series = df[col]
         numeric = pd.to_numeric(series, errors="coerce")
@@ -172,7 +181,7 @@ def profile_data(df: pd.DataFrame) -> dict[str, Any]:
             "unique": int(series.nunique(dropna=True)),
             "numeric_values": numeric_count,
             "possible_outliers_iqr": outliers,
-            "unit_hint": detect_units(df)[str(col)],
+            "unit_hint": units[str(col)],
         })
     return {
         "row_count": int(len(df)),
